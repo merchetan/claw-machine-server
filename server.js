@@ -1,23 +1,19 @@
 const express = require('express');
 const crypto = require('crypto');
-const axios = require('axios');
-
 const app = express();
 app.use(express.json());
 
 const WEBHOOK_SECRET = 'Ccc@0412';
 let esp32IP = '';
+let pendingPayments = [];
 
 app.get('/', (req, res) => {
   res.json({
-    status: 'running',
+    status:  'running',
     esp32IP: esp32IP || 'not connected',
-    message: 'UNIKO Claw Machine Live!'
+    message: 'UNIKO Claw Machine Live!',
+    pending: pendingPayments.length
   });
-});
-
-app.get('/webhook', (req, res) => {
-  res.json({ status: 'webhook ok' });
 });
 
 app.post('/register', (req, res) => {
@@ -26,86 +22,65 @@ app.post('/register', (req, res) => {
   res.json({ status: 'registered' });
 });
 
+app.get('/check-payment', (req, res) => {
+  console.log('Check payment called!');
+  if (pendingPayments.length > 0) {
+    const payment = pendingPayments.shift();
+    console.log('Sending to ESP32: Rs.' + payment.amount);
+    res.json({
+      payment: true,
+      amount:  payment.amount,
+      plays:   Math.floor(payment.amount / 10),
+      pulses:  Math.floor(payment.amount / 10) * 2
+    });
+  } else {
+    res.json({ payment: false });
+  }
+});
+
+app.get('/webhook', (req, res) => {
+  res.json({ status: 'webhook ok' });
+});
+
 app.post('/webhook', express.raw({type: '*/*'}), (req, res) => {
   console.log('Webhook received!');
-
   try {
-    const signature = req.headers['x-razorpay-signature'];
     const body = req.body.toString();
     const data = JSON.parse(body);
-
-    if (signature) {
-      const expectedSig = crypto
-        .createHmac('sha256', WEBHOOK_SECRET)
-        .update(body)
-        .digest('hex');
-
-      if (signature !== expectedSig) {
-        console.log('Invalid signature!');
-        return res.status(401).json({ error: 'Invalid' });
-      }
-    }
-
     const event = data.event;
     console.log('Event:', event);
 
     if (event === 'payment.captured') {
       const amount = data.payload.payment.entity.amount / 100;
-      console.log('Payment Rs.' + amount);
-
-      if (esp32IP) {
-        axios.get('http://' + esp32IP + '/trigger?amount=' + amount)
-          .then(() => console.log('ESP32 triggered!'))
-          .catch(err => console.log('ESP32 error:', err.message));
-      }
+      console.log('Payment! Rs.' + amount);
+      pendingPayments.push({ amount: amount });
     }
 
     if (event === 'payment_link.paid') {
       const amount = data.payload.payment_link.entity.amount / 100;
-      console.log('Link Payment Rs.' + amount);
-
-      if (esp32IP) {
-        axios.get('http://' + esp32IP + '/trigger?amount=' + amount)
-          .then(() => console.log('ESP32 triggered!'))
-          .catch(err => console.log('ESP32 error:', err.message));
-      }
+      console.log('Link paid! Rs.' + amount);
+      pendingPayments.push({ amount: amount });
     }
-
   } catch (err) {
     console.log('Error:', err.message);
   }
-
   res.status(200).json({ status: 'ok' });
 });
 
 app.get('/trigger', (req, res) => {
   const amount = parseInt(req.query.amount) || 10;
   console.log('Trigger Rs.' + amount);
-
-  if (esp32IP) {
-    axios.get('http://' + esp32IP + '/trigger?amount=' + amount)
-      .then(() => console.log('ESP32 triggered!'))
-      .catch(err => console.log('ESP32 error:', err.message));
-  }
-
+  pendingPayments.push({ amount: amount });
   res.json({
-    status: 'triggered',
-    amount: amount,
-    plays: Math.floor(amount / 10),
-    pulses: Math.floor(amount / 10) * 2
-  });
-});
-
-app.post('/create-order', (req, res) => {
-  const amount = req.body.amount || 10;
-  res.json({
-    orderId: 'CLAW_' + Date.now(),
-    amount: amount,
-    paymentLink: 'https://razorpay.me/@uniko?amount=' + (amount * 100)
+    status:  'triggered',
+    amount:  amount,
+    plays:   Math.floor(amount / 10),
+    pulses:  Math.floor(amount / 10) * 2,
+    pending: pendingPayments.length
   });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('Server running port ' + PORT);
+  console.log('Server running! Port: ' + PORT);
 });
