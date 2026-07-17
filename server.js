@@ -6,29 +6,15 @@ const WEBHOOK_SECRET = 'Ccc@0412';
 let esp32IP = '';
 let pendingPayments = [];
 
-// Must use raw body for webhook!
-app.use((req, res, next) => {
-  if (req.path === '/webhook') {
-    let data = '';
-    req.on('data', chunk => { data += chunk; });
-    req.on('end', () => {
-      req.rawBody = data;
-      try {
-        req.body = JSON.parse(data);
-      } catch(e) {
-        req.body = {};
-      }
-      next();
-    });
-  } else {
-    express.json()(req, res, next);
-  }
-});
+// Raw body for webhook signature
+app.use('/webhook', express.raw({ type: '*/*' }));
+// JSON for everything else
+app.use(express.json());
 
 app.get('/', (req, res) => {
   res.json({
     status:  'running',
-    version: '3.0',
+    version: '4.0',
     esp32IP: esp32IP || 'not connected',
     message: 'UNIKO Claw Machine Live!',
     pending: pendingPayments.length
@@ -42,10 +28,10 @@ app.post('/register', (req, res) => {
 });
 
 app.get('/check-payment', (req, res) => {
-  console.log('Check payment called! Pending: ' + pendingPayments.length);
+  console.log('Check payment! Pending: ' + pendingPayments.length);
   if (pendingPayments.length > 0) {
     const payment = pendingPayments.shift();
-    console.log('Sending to ESP32: Rs.' + payment.amount);
+    console.log('Sending Rs.' + payment.amount);
     res.json({
       payment: true,
       amount:  payment.amount,
@@ -63,38 +49,43 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', (req, res) => {
   console.log('Webhook received!');
-  console.log('Body:', JSON.stringify(req.body));
 
   try {
-    // Verify signature
-    const signature = req.headers['x-razorpay-signature'];
-    if (signature && req.rawBody) {
-      const expectedSig = crypto
-        .createHmac('sha256', WEBHOOK_SECRET)
-        .update(req.rawBody)
-        .digest('hex');
-      console.log('Expected:', expectedSig);
-      console.log('Received:', signature);
-      if (signature !== expectedSig) {
-        console.log('Signature mismatch! Still processing...');
-      }
-    }
+    // Parse raw body
+    const rawBody = req.body.toString('utf8');
+    console.log('Raw body:', rawBody.substring(0, 100));
 
-    const event = req.body.event;
+    const data = JSON.parse(rawBody);
+    const event = data.event;
     console.log('Event:', event);
 
+    // Verify signature
+    const signature = req.headers['x-razorpay-signature'];
+    if (signature) {
+      const expectedSig = crypto
+        .createHmac('sha256', WEBHOOK_SECRET)
+        .update(rawBody)
+        .digest('hex');
+
+      if (signature !== expectedSig) {
+        console.log('Invalid signature!');
+        return res.status(401).json({ error: 'Invalid' });
+      }
+      console.log('Signature valid!');
+    }
+
     if (event === 'payment.captured') {
-      const amount = req.body.payload.payment.entity.amount / 100;
-      console.log('Payment captured! Rs.' + amount);
+      const amount = data.payload.payment.entity.amount / 100;
+      console.log('Payment! Rs.' + amount);
       pendingPayments.push({ amount: amount });
-      console.log('Pending now:', pendingPayments.length);
+      console.log('Pending:', pendingPayments.length);
     }
 
     if (event === 'payment_link.paid') {
-      const amount = req.body.payload.payment_link.entity.amount / 100;
+      const amount = data.payload.payment_link.entity.amount / 100;
       console.log('Link paid! Rs.' + amount);
       pendingPayments.push({ amount: amount });
-      console.log('Pending now:', pendingPayments.length);
+      console.log('Pending:', pendingPayments.length);
     }
 
   } catch (err) {
@@ -106,9 +97,8 @@ app.post('/webhook', (req, res) => {
 
 app.get('/trigger', (req, res) => {
   const amount = parseInt(req.query.amount) || 10;
-  console.log('Manual trigger Rs.' + amount);
+  console.log('Trigger Rs.' + amount);
   pendingPayments.push({ amount: amount });
-  console.log('Pending now:', pendingPayments.length);
   res.json({
     status:  'triggered',
     amount:  amount,
@@ -120,5 +110,5 @@ app.get('/trigger', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('UNIKO Server v3.0 running! Port: ' + PORT);
+  console.log('UNIKO v4.0 running! Port: ' + PORT);
 });
