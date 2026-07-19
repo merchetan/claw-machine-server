@@ -1,114 +1,67 @@
 const express = require('express');
 const crypto = require('crypto');
+const axios = require('axios');
+require('dotenv').config();
+
 const app = express();
 
-const WEBHOOK_SECRET = 'Ccc@0412';
-let esp32IP = '';
-let pendingPayments = [];
+// IMPORTANT: Razorpay webhook signature verification needs the RAW body,
+// not JSON-parsed - so we capture it specially here.
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 
-app.use('/webhook', express.raw({type: '*/*'}));
-app.use(express.json());
+const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
+const ORACLE_SERVER_URL = process.env.ORACLE_SERVER_URL; // e.g. http://92.4.73.103:3000
 
 app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    version: '5.0',
-    esp32IP: esp32IP || 'not connected',
-    message: 'UNIKO Claw Machine Live!',
-    pending: pendingPayments.length
-  });
+  res.send('UNIKO Webhook Receiver - Running');
 });
 
-app.post('/register', (req, res) => {
-  esp32IP = req.body.ip;
-  console.log('ESP32 registered:', esp32IP);
-  res.json({ status: 'registered' });
-});
-
-app.get('/check-payment', (req, res) => {
-  console.log('Check payment! Pending:' + pendingPayments.length);
-  if (pendingPayments.length > 0) {
-    const payment = pendingPayments.shift();
-    console.log('Sending Rs.' + payment.amount);
-    res.json({
-      payment: true,
-      amount: payment.amount,
-      plays: Math.floor(payment.amount / 10),
-      pulses: Math.floor(payment.amount / 10) * 2
-    });
-  } else {
-    res.json({ payment: false });
-  }
-});
-
-app.get('/webhook', (req, res) => {
-  res.json({ status: 'webhook ok' });
-});
-
-app.post('/webhook', (req, res) => {
-  console.log('Webhook hit!');
+app.post('/webhook', async (req, res) => {
   try {
-    let rawBody = '';
-    let data = {};
-
-    if (Buffer.isBuffer(req.body)) {
-      rawBody = req.body.toString('utf8');
-      data = JSON.parse(rawBody);
-    } else {
-      rawBody = JSON.stringify(req.body);
-      data = req.body;
-    }
-
-    console.log('Event:', data.event);
-
+    // Step 1: Verify this webhook genuinely came from Razorpay
     const signature = req.headers['x-razorpay-signature'];
-    if (signature) {
-      const expectedSig = crypto
-        .createHmac('sha256', WEBHOOK_SECRET)
-        .update(rawBody)
-        .digest('hex');
-      if (signature !== expectedSig) {
-        console.log('Bad signature!');
-        return res.status(401).json({ error: 'Invalid' });
+    const expectedSignature = crypto
+      .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
+      .update(req.rawBody)
+      .digest('hex');
+
+    if (signature !== expectedSignature) {
+      console.log('Webhook signature mismatch - rejecting');
+      return res.status(400).json({ error: 'Invalid signature' });
+    }
+
+    const event = req.body.event;
+    console.log('Received Razorpay event:', event);
+
+    // Step 2: Handle QR code payment events
+    if (event === 'qr_code.credited' || event === 'payment.captured') {
+      const payload = req.body.payload;
+      const qrCode = payload.qr_code ? payload.qr_code.entity : null;
+      const payment = payload.payment ? payload.payment.entity : null;
+
+      // We stored our internal order_id in the QR code's "notes" field when creating it
+      const notes = qrCode ? qrCode.notes : (payment ? payment.notes : null);
+      const orderId = notes ? notes.order_id : null;
+
+      if (orderId) {
+        console.log('Marking order as paid:', orderId);
+        await axios.post(`${ORACLE_SERVER_URL}/mark-paid`, { order_id: orderId });
+      } else {
+        console.log('No order_id found in webhook notes - skipping');
       }
-      console.log('Signature OK!');
     }
 
-    if (data.event === 'payment.captured') {
-      const amount = data.payload.payment.entity.amount / 100;
-      console.log('Payment! Rs.' + amount);
-      pendingPayments.push({ amount: amount });
-      console.log('Pending now:', pendingPayments.length);
-    }
-
-    if (data.event === 'payment_link.paid') {
-      const amount = data.payload.payment_link.entity.amount / 100;
-      console.log('Link paid! Rs.' + amount);
-      pendingPayments.push({ amount: amount });
-      console.log('Pending now:', pendingPayments.length);
-    }
-
+    res.json({ status: 'ok' });
   } catch (err) {
-    console.log('Error:', err.message);
+    console.error('Webhook error:', err.message);
+    res.status(500).json({ error: err.message });
   }
-  res.status(200).json({ status: 'ok' });
 });
 
-app.get('/trigger', (req, res) => {
-  const amount = parseInt(req.query.amount) || 10;
-  console.log('Trigger Rs.' + amount);
-  pendingPayments.push({ amount: amount });
-  console.log('Pending now:', pendingPayments.length);
-  res.json({
-    status: 'triggered',
-    amount: amount,
-    plays: Math.floor(amount / 10),
-    pulses: Math.floor(amount / 10) * 2,
-    pending: pendingPayments.length
-  });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('UNIKO v5.0 running on port ' + PORT);
+app.listen(process.env.PORT || 3000, () => {
+  console.log('Webhook receiver running');
 });
