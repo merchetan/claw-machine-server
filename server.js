@@ -5,6 +5,8 @@ require('dotenv').config();
 
 const app = express();
 
+// IMPORTANT: Razorpay webhook signature verification needs the RAW body,
+// not JSON-parsed - so we capture it specially here.
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;
@@ -12,7 +14,7 @@ app.use(express.json({
 }));
 
 const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
-const ORACLE_SERVER_URL = process.env.ORACLE_SERVER_URL;
+const ORACLE_SERVER_URL = process.env.ORACLE_SERVER_URL; // e.g. http://92.4.73.103:3000
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
@@ -40,8 +42,17 @@ app.post('/webhook', async (req, res) => {
       const payment = payload.payment ? payload.payment.entity : null;
 
       if (payment && payment.status === 'captured') {
-        console.log('Forwarding captured payment:', payment.amount, 'paise');
-        await axios.post(`${ORACLE_SERVER_URL}/webhook-payment`, { amount: payment.amount });
+        const notes = payment.notes || {};
+        // Try several possible key names, since we're not 100% sure
+        // which exact key Razorpay uses for the custom field
+        const machineId = notes['Machine ID'] || notes['machine_id'] ||
+                           notes['MachineID'] || notes['machine id'] || null;
+
+        console.log('Forwarding captured payment:', payment.amount, 'paise, machine:', machineId || 'unknown');
+        await axios.post(`${ORACLE_SERVER_URL}/webhook-payment`, {
+          amount: payment.amount,
+          machine_id: machineId
+        });
       } else {
         console.log('Payment not captured yet - skipping');
       }
