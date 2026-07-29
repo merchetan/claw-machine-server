@@ -5,8 +5,6 @@ require('dotenv').config();
 
 const app = express();
 
-// IMPORTANT: Razorpay webhook signature verification needs the RAW body,
-// not JSON-parsed - so we capture it specially here.
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;
@@ -14,8 +12,8 @@ app.use(express.json({
 }));
 
 const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
-const ORACLE_SERVER_URL = process.env.ORACLE_SERVER_URL; // e.g. http://92.4.73.103:3000
-const PORT = process.env.PORT || 3000;
+const ORACLE_SERVER_URL = process.env.ORACLE_SERVER_URL;
+const PORT = process.env.PORT || 8080;
 
 app.get('/', (req, res) => {
   res.send('UNIKO Webhook Receiver - Running');
@@ -37,24 +35,19 @@ app.post('/webhook', async (req, res) => {
     const event = req.body.event;
     console.log('Received Razorpay event:', event);
 
-    if (event === 'payment.captured' || event === 'payment_link.paid') {
+    if (event === 'payment_link.paid' || event === 'payment.captured') {
       const payload = req.body.payload;
+      const paymentLink = payload.payment_link ? payload.payment_link.entity : null;
       const payment = payload.payment ? payload.payment.entity : null;
 
-      if (payment && payment.status === 'captured') {
-        const notes = payment.notes || {};
-        // Try several possible key names, since we're not 100% sure
-        // which exact key Razorpay uses for the custom field
-        const machineId = notes['Machine ID'] || notes['machine_id'] ||
-                           notes['MachineID'] || notes['machine id'] || null;
+      const notes = paymentLink ? paymentLink.notes : (payment ? payment.notes : null);
+      const orderId = notes ? notes.order_id : null;
 
-        console.log('Forwarding captured payment:', payment.amount, 'paise, machine:', machineId || 'unknown');
-        await axios.post(`${ORACLE_SERVER_URL}/webhook-payment`, {
-          amount: payment.amount,
-          machine_id: machineId
-        });
+      if (orderId) {
+        console.log('Marking order as paid:', orderId);
+        await axios.post(`${ORACLE_SERVER_URL}/mark-paid`, { order_id: orderId });
       } else {
-        console.log('Payment not captured yet - skipping');
+        console.log('No order_id found in webhook notes - skipping');
       }
     }
 
