@@ -35,19 +35,22 @@ app.post('/webhook', async (req, res) => {
     const event = req.body.event;
     console.log('Received Razorpay event:', event);
 
-    if (event === 'payment_link.paid' || event === 'payment.captured') {
+    if (event === 'payment.captured' || event === 'payment_link.paid') {
       const payload = req.body.payload;
-      const paymentLink = payload.payment_link ? payload.payment_link.entity : null;
       const payment = payload.payment ? payload.payment.entity : null;
 
-      const notes = paymentLink ? paymentLink.notes : (payment ? payment.notes : null);
-      const orderId = notes ? notes.order_id : null;
+      if (payment && payment.status === 'captured') {
+        const notes = payment.notes || {};
+        const machineId = notes['Machine ID'] || notes['machine_id'] ||
+                           notes['MachineID'] || notes['machine id'] || null;
 
-      if (orderId) {
-        console.log('Marking order as paid:', orderId);
-        await axios.post(`${ORACLE_SERVER_URL}/mark-paid`, { order_id: orderId });
+        console.log('Forwarding captured payment:', payment.amount, 'paise, machine:', machineId || 'unknown');
+        await axios.post(`${ORACLE_SERVER_URL}/webhook-payment`, {
+          amount: payment.amount,
+          machine_id: machineId
+        });
       } else {
-        console.log('No order_id found in webhook notes - skipping');
+        console.log('Payment not captured yet - skipping');
       }
     }
 
