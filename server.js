@@ -35,7 +35,21 @@ app.post('/webhook', async (req, res) => {
     const event = req.body.event;
     console.log('Received Razorpay event:', event);
 
-    if (event === 'payment.captured' || event === 'payment_link.paid') {
+    if (event === 'qr_code.credited') {
+      const payload = req.body.payload;
+      const qrCode = payload.qr_code ? payload.qr_code.entity : null;
+      const payment = payload.payment ? payload.payment.entity : null;
+
+      if (qrCode && payment) {
+        console.log('QR credited:', qrCode.id, '- amount:', payment.amount, 'paise');
+        await axios.post(`${ORACLE_SERVER_URL}/webhook-qr-payment`, {
+          qr_code_id: qrCode.id,
+          amount: payment.amount
+        });
+      }
+    }
+
+    else if (event === 'payment.captured' || event === 'payment_link.paid') {
       const payload = req.body.payload;
       const payment = payload.payment ? payload.payment.entity : null;
 
@@ -49,8 +63,6 @@ app.post('/webhook', async (req, res) => {
           amount: payment.amount,
           machine_id: machineId
         });
-      } else {
-        console.log('Payment not captured yet - skipping');
       }
     }
 
