@@ -15,6 +15,23 @@ const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
 const ORACLE_SERVER_URL = process.env.ORACLE_SERVER_URL;
 const PORT = process.env.PORT || 8080;
 
+// In-memory dedupe cache: Razorpay retries webhooks if it doesn't get a fast
+// 200 response, which was causing the SAME payment to be forwarded to Oracle
+// 2-3 times and firing extra relay pulses. We remember recently-seen payment
+// IDs for 10 minutes and skip forwarding if we've already processed one.
+const processedPayments = new Map(); // payment_id -> timestamp
+const DEDUPE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
+function alreadyProcessed(paymentId) {
+  const now = Date.now();
+  for (const [id, ts] of processedPayments) {
+    if (now - ts > DEDUPE_WINDOW_MS) processedPayments.delete(id);
+  }
+  if (processedPayments.has(paymentId)) return true;
+  processedPayments.set(paymentId, now);
+  return false;
+}
+
 app.get('/', (req, res) => {
   res.send('UNIKO Webhook Receiver - Running');
 });
@@ -45,10 +62,15 @@ app.post('/webhook', async (req, res) => {
       const payment = payload.payment ? payload.payment.entity : null;
 
       if (qrCode && payment) {
-        console.log('QR credited:', qrCode.id, '- amount:', payment.amount, 'paise');
+        if (alreadyProcessed(payment.id)) {
+          console.log('Duplicate webhook for payment', payment.id, '- skipping (already forwarded)');
+          return res.json({ status: 'ok', duplicate: true });
+        }
+        console.log('QR credited:', qrCode.id, '- amount:', payment.amount, 'paise, payment:', payment.id);
         await axios.post(`${ORACLE_SERVER_URL}/webhook-qr-payment`, {
           qr_code_id: qrCode.id,
-          amount: payment.amount
+          amount: payment.amount,
+          payment_id: payment.id
         });
       }
     }
@@ -61,14 +83,19 @@ app.post('/webhook', async (req, res) => {
       const payment = payload.payment ? payload.payment.entity : null;
 
       if (payment && payment.status === 'captured') {
+        if (alreadyProcessed(payment.id)) {
+          console.log('Duplicate webhook for payment', payment.id, '- skipping (already forwarded)');
+          return res.json({ status: 'ok', duplicate: true });
+        }
         const notes = payment.notes || {};
         const machineId = notes['Machine ID'] || notes['machine_id'] ||
                            notes['MachineID'] || notes['machine id'] || null;
 
-        console.log('Forwarding captured payment:', payment.amount, 'paise, machine:', machineId || 'unknown');
+        console.log('Forwarding captured payment:', payment.amount, 'paise, machine:', machineId || 'unknown, payment:', payment.id);
         await axios.post(`${ORACLE_SERVER_URL}/webhook-payment`, {
           amount: payment.amount,
-          machine_id: machineId
+          machine_id: machineId,
+          payment_id: payment.id
         });
       }
     }
