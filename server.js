@@ -35,6 +35,10 @@ app.post('/webhook', async (req, res) => {
     const event = req.body.event;
     console.log('Received Razorpay event:', event);
 
+    // Real QR Code payments - most reliable routing, uses the QR's own ID
+    // Real QR Code payments - the ONLY event we process for QR payments.
+    // (Razorpay also sends a generic "payment.captured" event for the same
+    // transaction - we deliberately ignore that one to avoid double-crediting.)
     if (event === 'qr_code.credited') {
       const payload = req.body.payload;
       const qrCode = payload.qr_code ? payload.qr_code.entity : null;
@@ -49,7 +53,10 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    else if (event === 'payment.captured' || event === 'payment_link.paid') {
+    // payment.captured / payment_link.paid: only used for OLDER machines still
+    // on Payment Links (not real QR codes). Skipped entirely if it's actually
+    // a QR code payment, to prevent double-crediting the same transaction.
+    else if (event === 'payment_link.paid') {
       const payload = req.body.payload;
       const payment = payload.payment ? payload.payment.entity : null;
 
