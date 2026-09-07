@@ -1,107 +1,75 @@
 const express = require('express');
-const crypto = require('crypto');
 const axios = require('axios');
-require('dotenv').config();
-
 const app = express();
 
-app.use(express.json({
-  verify: (req, res, buf) => {
-    req.rawBody = buf;
-  }
-}));
+app.use(express.json());
 
-const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
-const ORACLE_SERVER_URL = process.env.ORACLE_SERVER_URL;
+const ORACLE_SERVER_URL = process.env.ORACLE_SERVER_URL || 'http://92.4.73.103:3000';
 const PORT = process.env.PORT || 8080;
 
-app.get('/', (req, res) => {
-  res.send('UNIKO Webhook Receiver - Running');
-});
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// Tries to forward to the Oracle server, retrying a few times with a short
-// delay if it fails - so a brief network blip doesn't silently lose a payment.
-async function forwardWithRetry(url, data, maxAttempts = 3) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      await axios.post(url, data, { timeout: 8000 });
-      console.log(`Forwarded successfully to ${url} (attempt ${attempt})`);
-      return true;
-    } catch (err) {
-      console.error(`Forward attempt ${attempt} to ${url} failed:`, err.message);
-      if (attempt < maxAttempts) {
-        await sleep(2000 * attempt);
-      }
-    }
-  }
-  console.error(`GAVE UP forwarding to ${url} after ${maxAttempts} attempts. Data:`, JSON.stringify(data));
-  return false;
-}
-
 app.post('/webhook', async (req, res) => {
-  try {
-    const signature = req.headers['x-razorpay-signature'];
-    const expectedSignature = crypto
-      .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
-      .update(req.rawBody)
-      .digest('hex');
+  const event = req.body.event;
 
-    if (signature !== expectedSignature) {
-      console.log('Webhook signature mismatch - rejecting');
-      return res.status(400).json({ error: 'Invalid signature' });
-    }
+  // We only process qr_code.credited - NOT payment.captured, since that
+  // would double-credit the same payment (both events fire for the same
+  // transaction).
+  if (event !== 'qr_code.credited') {
+    return res.status(200).json({ status: 'ignored', reason: 'not a qr_code.credited event' });
+  }
 
-    const event = req.body.event;
-    console.log('Received Razorpay event:', event);
+  try {
+    const payload = req.body.payload;
+    const qrCodeId = payload.qr_code.entity.id;
+    const amountPaise = payload.payment.entity.amount;
 
-    // Real QR Code payments - the ONLY event we process for QR payments.
-    // (Razorpay also sends a generic "payment.captured" event for the same
-    // transaction - we deliberately ignore that one to avoid double-crediting.)
-    if (event === 'qr_code.credited') {
-      const payload = req.body.payload;
-      const qrCode = payload.qr_code ? payload.qr_code.entity : null;
-      const payment = payload.payment ? payload.payment.entity : null;
+    // Razorpay's payment entity includes its own unique payment ID here -
+    // this is the exact reference needed to look up or refund this specific
+    // payment later, e.g. "pay_XXXXXXXXXXXXX".
+    const razorpayPaymentId = payload.payment.entity.id;
 
-      if (qrCode && payment) {
-        console.log('QR credited:', qrCode.id, '- amount:', payment.amount, 'paise, payment:', payment.id);
-        await forwardWithRetry(`${ORACLE_SERVER_URL}/webhook-qr-payment`, {
-          qr_code_id: qrCode.id,
-          amount: payment.amount
-        });
-      }
-    }
+    console.log(`Received qr_code.credited: QR=${qrCodeId}, amount=${amountPaise}, payment_id=${razorpayPaymentId}`);
 
-    // payment.captured / payment_link.paid: only used for OLDER machines still
-    // on Payment Links (not real QR codes). Skipped entirely if it's actually
-    // a QR code payment, to prevent double-crediting the same transaction.
-    else if (event === 'payment_link.paid') {
-      const payload = req.body.payload;
-      const payment = payload.payment ? payload.payment.entity : null;
+    // Retry logic: attempt delivery to Oracle up to 3 times with increasing
+    // gaps, in case of a transient network blip - a lost webhook means a
+    // real customer's payment never gets recorded at all.
+    const delays = [2000, 4000, 6000];
+    let delivered = false;
 
-      if (payment && payment.status === 'captured') {
-        const notes = payment.notes || {};
-        const machineId = notes['Machine ID'] || notes['machine_id'] ||
-                           notes['MachineID'] || notes['machine id'] || null;
+    for (let attempt = 0; attempt < delays.length && !delivered; attempt++) {
+      try {
+        await axios.post(`${ORACLE_SERVER_URL}/webhook-qr-payment`, {
+          qr_code_id: qrCodeId,
+          amount: amountPaise,
+          payment_id: razorpayPaymentId
+        }, { timeout: 5000 });
+        delivered = true;
+        console.log(`Delivered to Oracle successfully (attempt ${attempt + 1}).`);
+      } catch (err) {
+        console.error(`Delivery attempt ${attempt + 1} failed:`, err.message);
+        if (attempt < delays.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+        }
+      }
+    }
 
-        console.log('Forwarding captured payment:', payment.amount, 'paise, machine:', machineId || 'unknown');
-        await forwardWithRetry(`${ORACLE_SERVER_URL}/webhook-payment`, {
-          amount: payment.amount,
-          machine_id: machineId
-        });
-      }
-    }
+    if (!delivered) {
+      console.error(`FAILED to deliver payment to Oracle after ${delays.length} attempts: QR=${qrCodeId}, payment_id=${razorpayPaymentId}`);
+      // Still return 200 to Razorpay so it doesn't retry the webhook itself
+      // (that could cause duplicate processing on our side) - the payment
+      // reference is logged above for manual recovery if needed.
+    }
 
-    res.json({ status: 'ok' });
-  } catch (err) {
-    console.error('Webhook error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    res.status(200).json({ status: delivered ? 'delivered' : 'logged_but_not_delivered' });
+  } catch (err) {
+    console.error('Webhook processing error:', err.message);
+    res.status(200).json({ status: 'error', error: err.message });
+  }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('Webhook receiver running on port ' + PORT);
+app.get('/', (req, res) => {
+  res.json({ status: 'UNIKO webhook receiver running' });
+});
+
+app.listen(PORT, () => {
+  console.log(`Webhook receiver listening on port ${PORT}`);
 });
